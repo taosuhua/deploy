@@ -3,9 +3,17 @@
 ################################################################################
 # 报价合同管理系统 - 一键部署脚本
 # 适用于 Ubuntu 20.04 / 22.04
+# 支持root用户和普通用户
 ################################################################################
 
-set -e  # 遇到错误立即退出
+# set -e  # 遇到错误立即退出  # 已禁用，允许用户重试
+
+# 在脚本开头设置SUDO变量
+if [ "$EUID" -eq 0 ]; then
+    SUDO=""
+else
+    SUDO="sudo"
+fi
 
 # 颜色定义
 RED='\033[0;31m'
@@ -92,9 +100,9 @@ install_system_dependencies() {
     # 如果有需要安装的包
     if [ -n "$packages" ]; then
         print_info "需要安装以下系统包: $packages"
-        echo "正在执行: sudo apt update && sudo apt install -y $packages"
-        sudo apt update
-        sudo apt install -y $packages
+        echo "正在执行: $SUDO apt update && $SUDO apt install -y $packages"
+        $SUDO apt update
+        $SUDO apt install -y $packages
         print_success "系统依赖安装完成"
     else
         print_success "所有系统依赖已满足"
@@ -212,12 +220,12 @@ save_instance_info() {
     source /tmp/deploy_config.tmp
 
     # 确保目录存在
-    sudo mkdir -p "$BASE_DIR"
+    $SUDO mkdir -p "$BASE_DIR"
 
     # 创建或更新实例文件
     if [ ! -f "$INSTANCES_FILE" ]; then
         # 首次部署，创建新文件
-        sudo tee "$INSTANCES_FILE" > /dev/null << EOF
+        $SUDO tee "$INSTANCES_FILE" > /dev/null << EOF
 {
   "instances": [
     {
@@ -293,7 +301,7 @@ clone_repository() {
             cd "$instance_dir"
             return 0
         fi
-        sudo rm -rf "$instance_dir"
+        $SUDO rm -rf "$instance_dir"
     fi
 
     # 克隆仓库
@@ -327,7 +335,7 @@ setup_virtualenv() {
         read -p "是否要重建虚拟环境？(y/N): " rebuild_venv
         if [[ "$rebuild_venv" =~ ^[Yy]$ ]]; then
             print_info "删除旧虚拟环境..."
-            sudo rm -rf "$venv_dir"
+            $SUDO rm -rf "$venv_dir"
         else
             print_info "使用现有虚拟环境"
             return 0
@@ -390,8 +398,12 @@ setup_database() {
     cd "$instance_dir"
 
     # 创建instance目录
-    sudo mkdir -p instance
-    sudo chown $USER:$USER instance
+    $SUDO mkdir -p instance
+
+    # 只有非root用户才需要chown
+    if [ "$EUID" -ne 0 ]; then
+        $SUDO chown $USER:$USER instance
+    fi
 
     local db_file="instance/quotation.db"
 
@@ -447,7 +459,9 @@ PYTHON
     fi
 
     # 设置数据库权限
-    sudo chown -R $USER:$USER instance
+    if [ "$EUID" -ne 0 ]; then
+        $SUDO chown -R $USER:$USER instance
+    fi
 }
 
 ################################################################################
@@ -498,16 +512,31 @@ create_systemd_service() {
     local venv_dir="$instance_dir/venv"
     local service_file="${SERVICE_NAME}@${SERVICE_PORT}.service"
 
+    # 确定服务运行用户
+    local service_user
+    local service_group
+
+    if [ "$EUID" -eq 0 ]; then
+        # root用户运行
+        service_user="root"
+        service_group="root"
+        print_info "服务将以root用户运行"
+    else
+        service_user="$USER"
+        service_group="$USER"
+        print_info "服务将以 $USER 用户运行"
+    fi
+
     # 创建服务文件
-    sudo tee /etc/systemd/system/$service_file > /dev/null << EOF
+    $SUDO tee /etc/systemd/system/$service_file > /dev/null << EOF
 [Unit]
 Description=Quotation Management System Instance on port $SERVICE_PORT
 After=network.target
 
 [Service]
 Type=simple
-User=$USER
-Group=$USER
+User=$service_user
+Group=$service_group
 WorkingDirectory=$instance_dir
 Environment="PATH=$venv_dir/bin"
 ExecStart=$venv_dir/bin/python app.py
@@ -519,10 +548,10 @@ WantedBy=multi-user.target
 EOF
 
     # 重新加载systemd
-    sudo systemctl daemon-reload
+    $SUDO systemctl daemon-reload
 
     # 启用服务
-    sudo systemctl enable $service_file
+    $SUDO systemctl enable $service_file
 
     print_success "systemd服务创建完成: $service_file"
 }
@@ -539,11 +568,11 @@ configure_firewall() {
         # 检查ufw是否安装
         if command_exists ufw; then
             print_info "开放端口 $SERVICE_PORT..."
-            sudo ufw allow $SERVICE_PORT/tcp
+            $SUDO ufw allow $SERVICE_PORT/tcp
             print_success "防火墙规则已添加"
         else
             print_warning "ufw未安装，跳过防火墙配置"
-            print_info "如需配置防火墙，请运行: sudo apt install ufw && sudo ufw allow $SERVICE_PORT/tcp"
+            print_info "如需配置防火墙，请运行: $SUDO apt install ufw && $SUDO ufw allow $SERVICE_PORT/tcp"
         fi
     fi
 }
@@ -559,17 +588,17 @@ start_service() {
     local service_file="${SERVICE_NAME}@${SERVICE_PORT}.service"
 
     print_info "启动服务 $service_file ..."
-    sudo systemctl start $service_file
+    $SUDO systemctl start $service_file
 
     # 等待服务启动
     sleep 3
 
     # 检查服务状态
-    if sudo systemctl is-active --quiet $service_file; then
+    if $SUDO systemctl is-active --quiet $service_file; then
         print_success "服务启动成功！"
     else
         print_error "服务启动失败，查看日志："
-        sudo journalctl -u $service_file -n 50 --no-pager
+        $SUDO journalctl -u $service_file -n 50 --no-pager
         exit 1
     fi
 }
@@ -598,11 +627,11 @@ show_deployment_info() {
     echo "  http://$(hostname -I | awk '{print $1}'):$SERVICE_PORT"
     echo ""
     echo -e "${BLUE}管理命令:${NC}"
-    echo "  查看状态: sudo systemctl status $service_file"
-    echo "  启动服务: sudo systemctl start $service_file"
-    echo "  停止服务: sudo systemctl stop $service_file"
-    echo "  重启服务: sudo systemctl restart $service_file"
-    echo "  查看日志: sudo journalctl -u $service_file -f"
+    echo "  查看状态: $SUDO systemctl status $service_file"
+    echo "  启动服务: $SUDO systemctl start $service_file"
+    echo "  停止服务: $SUDO systemctl stop $service_file"
+    echo "  重启服务: $SUDO systemctl restart $service_file"
+    echo "  查看日志: $SUDO journalctl -u $service_file -f"
     echo ""
     echo -e "${BLUE}数据库位置:${NC}"
     echo "  $BASE_DIR/$INSTANCE_NAME/instance/quotation.db"
@@ -620,9 +649,20 @@ show_deployment_info() {
 main() {
     # 检查是否为root用户
     if [ "$EUID" -eq 0 ]; then
-        print_error "请不要使用root用户运行此脚本"
-        print_info "建议使用普通用户，脚本会在需要时使用sudo"
-        exit 1
+        print_warning "正在以root用户运行"
+        print_info "建议创建专用用户运行此服务（可选）"
+        echo ""
+        read -p "是否继续以root用户部署？(y/N): " continue_as_root
+        if [[ ! "$continue_as_root" =~ ^[Yy]$ ]]; then
+            print_info "部署已取消"
+            echo ""
+            print_info "创建专用用户的方法："
+            echo "  $SUDO useradd -m -s /bin/bash quotation"
+            echo "  $SUDO passwd quotation"
+            echo "  su - quotation"
+            echo "  ./deploy.sh"
+            exit 0
+        fi
     fi
 
     print_header "报价合同管理系统 - 一键部署脚本"
