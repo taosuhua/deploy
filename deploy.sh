@@ -475,18 +475,43 @@ generate_config() {
     local instance_dir="$BASE_DIR/$INSTANCE_NAME"
     cd "$instance_dir"
 
+    # 收集 Cloudflare Turnstile 配置
+    echo ""
+    print_info "Cloudflare Turnstile 人机验证配置"
+    echo "  获取密钥: https://dash.cloudflare.com > Turnstile"
+    echo ""
+    read -p "请输入 Turnstile Site Key: " turnstile_site_key
+    read -p "请输入 Turnstile Secret Key: " turnstile_secret_key
+
+    if [ -z "$turnstile_site_key" ] || [ -z "$turnstile_secret_key" ]; then
+        print_warning "未输入 Turnstile 密钥，登录验证将被禁用"
+        turnstile_site_key=""
+        turnstile_secret_key=""
+        enable_turnstile="false"
+    else
+        enable_turnstile="true"
+    fi
+
     # 生成config_local.py
     local secret_key=$(openssl rand -hex 32)
 
     cat > config_local.py << EOF
-# 自动生成的配置文件
+# 自动生成的配置文件 - 请勿手动修改
+# Auto-generated configuration file - Do not modify manually
+# 部署时间: $(date)
 import os
+from config import Config
 
-class Config:
+class LocalConfig(Config):
     SECRET_KEY = '$secret_key'
 
-    # 注意：在生产环境中应该设置环境变量而不是硬编码
-    # 部署时间: $(date)
+    # Debug模式（生产环境关闭）
+    DEBUG = False
+
+    # Cloudflare Turnstile 配置
+    ENABLE_TURNSTILE = $enable_turnstile
+    TURNSTILE_SITE_KEY = '$turnstile_site_key'
+    TURNSTILE_SECRET_KEY = '$turnstile_secret_key'
 
 # 部署信息
 DEPLOYMENT_INFO = {
@@ -539,6 +564,7 @@ User=$service_user
 Group=$service_group
 WorkingDirectory=$instance_dir
 Environment="PATH=$venv_dir/bin"
+Environment="PORT=$SERVICE_PORT"
 ExecStart=$venv_dir/bin/python app.py
 Restart=always
 RestartSec=10
@@ -644,6 +670,152 @@ show_deployment_info() {
 }
 
 ################################################################################
+# 删除已部署实例
+################################################################################
+delete_instance() {
+    print_header "删除已部署实例"
+
+    if [ ! -f "$INSTANCES_FILE" ]; then
+        print_error "未找到实例记录文件: $INSTANCES_FILE"
+        print_info "没有已部署的实例"
+        exit 1
+    fi
+
+    # 读取实例列表
+    local instance_count
+    instance_count=$(python3 -c "
+import json
+with open('$INSTANCES_FILE') as f:
+    data = json.load(f)
+print(len(data.get('instances', [])))
+")
+
+    if [ "$instance_count" -eq 0 ]; then
+        print_info "没有已部署的实例"
+        exit 0
+    fi
+
+    # 显示实例列表
+    echo -e "${BLUE}已部署的实例:${NC}"
+    echo ""
+    python3 << 'PYTHON'
+import json
+with open('/opt/quotation-system/instances.json') as f:
+    data = json.load(f)
+for idx, inst in enumerate(data['instances'], 1):
+    print(f"  {idx}. 实例名称: {inst['name']}")
+    print(f"     端口: {inst['port']}")
+    print(f"     目录: {inst['dir']}")
+    print(f"     服务: {inst['service']}")
+    print(f"     创建时间: {inst['created_at']}")
+    print("")
+PYTHON
+
+    # 选择实例
+    echo ""
+    read -p "请输入要删除的实例序号 (输入 0 取消): " choice
+
+    if [[ "$choice" == "0" ]] || [ -z "$choice" ]; then
+        print_info "已取消"
+        exit 0
+    fi
+
+    if ! [[ "$choice" =~ ^[0-9]+$ ]] || [ "$choice" -lt 1 ] || [ "$choice" -gt "$instance_count" ]; then
+        print_error "无效的选择"
+        exit 1
+    fi
+
+    # 获取选中实例的信息
+    local selected_info
+    selected_info=$(python3 -c "
+import json
+with open('$INSTANCES_FILE') as f:
+    data = json.load(f)
+inst = data['instances'][$((choice - 1))]
+print(f\"{inst['name']}|{inst['port']}|{inst['dir']}|{inst['service']}\")
+")
+
+    local sel_name=$(echo "$selected_info" | cut -d'|' -f1)
+    local sel_port=$(echo "$selected_info" | cut -d'|' -f2)
+    local sel_dir=$(echo "$selected_info" | cut -d'|' -f3)
+    local sel_service=$(echo "$selected_info" | cut -d'|' -f4)
+
+    # 确认删除
+    echo ""
+    echo -e "${RED}即将删除以下实例:${NC}"
+    echo "  实例名称: $sel_name"
+    echo "  端口: $sel_port"
+    echo "  目录: $sel_dir"
+    echo "  服务: $sel_service"
+    echo ""
+    read -p "确认删除？此操作不可恢复！(yes/no): " confirm
+
+    if [[ "$confirm" != "yes" ]]; then
+        print_info "已取消"
+        exit 0
+    fi
+
+    # 开始删除
+    print_info "正在删除实例: $sel_name ..."
+
+    # 1. 停止并禁用 systemd 服务
+    if systemctl is-active --quiet "$sel_service" 2>/dev/null; then
+        print_info "停止服务: $sel_service ..."
+        $SUDO systemctl stop "$sel_service"
+    fi
+
+    if systemctl is-enabled --quiet "$sel_service" 2>/dev/null; then
+        print_info "禁用服务: $sel_service ..."
+        $SUDO systemctl disable "$sel_service"
+    fi
+
+    # 2. 删除 systemd 服务文件
+    if [ -f "/etc/systemd/system/$sel_service" ]; then
+        print_info "删除服务文件: $sel_service ..."
+        $SUDO rm -f "/etc/systemd/system/$sel_service"
+        $SUDO systemctl daemon-reload
+    fi
+
+    # 3. 删除实例目录
+    if [ -d "$sel_dir" ]; then
+        print_info "删除实例目录: $sel_dir ..."
+        $SUDO rm -rf "$sel_dir"
+    fi
+
+    # 4. 删除防火墙规则
+    if command_exists ufw; then
+        print_info "移除防火墙规则: 端口 $sel_port ..."
+        $SUDO ufw delete allow "$sel_port/tcp" >/dev/null 2>&1
+    fi
+
+    # 5. 从 instances.json 中移除
+    print_info "更新实例记录..."
+    python3 -c "
+import json
+with open('$INSTANCES_FILE') as f:
+    data = json.load(f)
+data['instances'] = [i for i in data['instances'] if i['name'] != '$sel_name']
+with open('$INSTANCES_FILE', 'w') as f:
+    json.dump(data, f, indent=2)
+"
+
+    # 如果没有剩余实例，删除 instances.json
+    local remaining
+    remaining=$(python3 -c "
+import json
+with open('$INSTANCES_FILE') as f:
+    data = json.load(f)
+print(len(data.get('instances', [])))
+")
+    if [ "$remaining" -eq 0 ]; then
+        $SUDO rm -f "$INSTANCES_FILE"
+    fi
+
+    echo ""
+    print_success "实例 '$sel_name' 已完整删除"
+}
+
+################################################################################
 # 主函数
 ################################################################################
 main() {
@@ -713,6 +885,11 @@ main() {
 }
 
 ################################################################################
-# 运行主函数
+# 运行
 ################################################################################
-main
+# 检查参数
+if [ "$1" == "-delete" ]; then
+    delete_instance
+else
+    main
+fi
