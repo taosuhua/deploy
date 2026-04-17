@@ -487,9 +487,9 @@ generate_config() {
         print_warning "未输入 Turnstile 密钥，登录验证将被禁用"
         turnstile_site_key=""
         turnstile_secret_key=""
-        enable_turnstile="false"
+        enable_turnstile="False"
     else
-        enable_turnstile="true"
+        enable_turnstile="True"
     fi
 
     # 生成config_local.py
@@ -563,7 +563,7 @@ Type=simple
 User=$service_user
 Group=$service_group
 WorkingDirectory=$instance_dir
-Environment="PATH=$venv_dir/bin"
+Environment="PATH=$venv_dir/bin:/usr/local/bin:/usr/bin:/bin"
 Environment="PORT=$SERVICE_PORT"
 ExecStart=$venv_dir/bin/python app.py
 Restart=always
